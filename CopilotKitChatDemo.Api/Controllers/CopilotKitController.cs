@@ -57,7 +57,22 @@ public class CopilotKitController : ControllerBase
 
         await foreach (var update in chatClient.CompleteChatStreamingAsync(chatMessages))
         {
-            var delta = string.Concat(update.ContentUpdate.Select(c => c.Text));
+            if (update.ContentUpdate is null)
+            {
+                continue;
+            }
+
+            var deltaBuilder = new StringBuilder();
+
+            foreach (var contentPart in update.ContentUpdate)
+            {
+                if (!string.IsNullOrEmpty(contentPart.Text))
+                {
+                    deltaBuilder.Append(contentPart.Text);
+                }
+            }
+
+            var delta = deltaBuilder.ToString();
             if (string.IsNullOrEmpty(delta))
             {
                 continue;
