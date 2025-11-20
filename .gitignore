@@ -1,0 +1,12 @@
+# Node
+node_modules
+npm-debug.log*
+.next
+out
+.env.local
+
+# Dotnet
+bin/
+obj/
+*.user
+*.swp
