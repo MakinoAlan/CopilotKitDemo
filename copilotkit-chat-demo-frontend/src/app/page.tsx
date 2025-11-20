@@ -1,17 +1,18 @@
 // copilotkit-chat-demo-frontend/src/app/page.tsx
 "use client";
 
-import { CopilotKitProvider } from "@copilotkit/react-core";
+import { CopilotKit } from "@copilotkit/react-core";
 import { CopilotChat } from "@copilotkit/react-ui";
 import { runtimeUrl } from "@/lib/copilot-config";
 
 export default function Home() {
   return (
-    <CopilotKitProvider
+    <CopilotKit
       runtimeUrl={runtimeUrl}
       // This tells CopilotKit where to send chat + tool calls. Our ASP.NET API implements
       // a compatible runtime endpoint at /copilotkit.
-      publicApiKey="demo-placeholder"
+      // For Copilot Cloud, set NEXT_PUBLIC_COPILOTKIT_PUBLIC_API_KEY and omit runtimeUrl.
+      publicApiKey={process.env.NEXT_PUBLIC_COPILOTKIT_PUBLIC_API_KEY ?? "demo-placeholder"}
     >
       <section className="card">
         <div className="header">
@@ -37,6 +38,6 @@ export default function Home() {
           />
         </div>
       </section>
-    </CopilotKitProvider>
+    </CopilotKit>
   );
 }
