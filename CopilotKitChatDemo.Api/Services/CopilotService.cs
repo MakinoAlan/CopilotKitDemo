@@ -13,16 +13,19 @@ namespace CopilotKitChatDemo.Api.Services;
 
 public class CopilotService : ICopilotService
 {
-    private const string DefaultModel = "gpt-4.1-mini";
+    private const string DefaultModel = "gpt-4o";
 
     private readonly OpenAIClient _client;
     private readonly string _model;
     private readonly ILogger<CopilotService> _logger;
+    private readonly McpClient _mcpClient;
 
     public CopilotService(IOptions<OpenAIOptions> openAiOptions, ILogger<CopilotService> logger, IConfiguration configuration)
     {
         _logger = logger;
-        var configuredApiKey = openAiOptions.Value.ApiKey
+        _mcpClient = new McpClient(); // In a real app, inject this via DI
+
+        var configuredApiKey = openAiOptions?.Value?.ApiKey
                                ?? configuration["OPENAI_API_KEY"]
                                ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 
@@ -144,38 +147,118 @@ public class CopilotService : ICopilotService
             };
         }).ToList();
 
-        var chatClient = _client.GetChatClient(_model);
-
-        await foreach (var update in chatClient.CompleteChatStreamingAsync(chatMessages, options: null, cancellationToken))
+        // Inject system prompt to enforce tool usage
+        if (!chatMessages.Any(m => m is SystemChatMessage))
         {
-            if (update.ContentUpdate is null)
-            {
-                continue;
-            }
+            chatMessages.Insert(0, new SystemChatMessage("You are a helpful assistant. You have access to tools. You MUST use the tools when the user asks for information that can be retrieved by them (like weather). Do not just say you will do it; actually call the tool."));
+        }
 
-            var deltaBuilder = new StringBuilder();
+        var chatClient = _client.GetChatClient(_model);
+        var tools = _mcpClient.GetTools().ToList();
+        var options = new ChatCompletionOptions();
+        foreach (var tool in tools)
+        {
+            options.Tools.Add(tool);
+        }
 
-            foreach (var contentPart in update.ContentUpdate)
+        bool keepIterating = true;
+        while (keepIterating)
+        {
+            keepIterating = false;
+            var completionUpdates = chatClient.CompleteChatStreamingAsync(chatMessages, options, cancellationToken);
+            
+            var toolCallBuffer = new Dictionary<int, (string Name, StringBuilder Arguments)>();
+            var currentToolCallIndex = -1;
+
+            await foreach (var update in completionUpdates)
             {
-                if (!string.IsNullOrEmpty(contentPart.Text))
+                // Handle Tool Calls
+                if (update.ToolCallUpdates.Count > 0)
                 {
-                    deltaBuilder.Append(contentPart.Text);
+                    _logger.LogInformation("Received ToolCallUpdates: {Count}", update.ToolCallUpdates.Count);
+                    foreach (var toolUpdate in update.ToolCallUpdates)
+                    {
+                        if (toolUpdate.Index >= 0)
+                        {
+                            currentToolCallIndex = toolUpdate.Index;
+                            if (!toolCallBuffer.ContainsKey(currentToolCallIndex))
+                            {
+                                toolCallBuffer[currentToolCallIndex] = (toolUpdate.FunctionName, new StringBuilder());
+                                _logger.LogInformation("New Tool Call: Index={Index}, Name={Name}", currentToolCallIndex, toolUpdate.FunctionName);
+                            }
+                        }
+                        
+                        if (toolUpdate.FunctionArgumentsUpdate != null && currentToolCallIndex >= 0)
+                        {
+                            toolCallBuffer[currentToolCallIndex].Arguments.Append(toolUpdate.FunctionArgumentsUpdate);
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle Content
+                if (update.ContentUpdate.Count > 0)
+                {
+                    var deltaBuilder = new StringBuilder();
+                    foreach (var contentPart in update.ContentUpdate)
+                    {
+                        if (!string.IsNullOrEmpty(contentPart.Text))
+                        {
+                            deltaBuilder.Append(contentPart.Text);
+                        }
+                    }
+
+                    var delta = deltaBuilder.ToString();
+                    if (!string.IsNullOrEmpty(delta))
+                    {
+                        _logger.LogInformation("Received Content: {Content}", delta);
+                        var payloads = JsonSerializer.Serialize(new
+                        {
+                            type = "response-text",
+                            content = delta,
+                        });
+                        yield return new StreamingChunk(payloads);
+                    }
                 }
             }
 
-            var delta = deltaBuilder.ToString();
-            if (string.IsNullOrEmpty(delta))
+            // Process accumulated tool calls
+            if (toolCallBuffer.Count > 0)
             {
-                continue;
+                var toolCalls = new List<ChatToolCall>();
+                foreach (var kvp in toolCallBuffer)
+                {
+                    var toolCallId = Guid.NewGuid().ToString(); // OpenAI .NET SDK might not expose ID in streaming easily, generating one or need to capture it if available. 
+                    // Actually, for the purpose of the conversation history, we need to append the Assistant's tool call message.
+                    // But since we are streaming, we might need to reconstruct the Assistant message.
+                    
+                    var functionName = kvp.Value.Name;
+                    var arguments = kvp.Value.Arguments.ToString();
+                    
+                    // Execute Tool
+                    string result = string.Empty;
+                    try 
+                    {
+                        result = await _mcpClient.ExecuteToolAsync(functionName, arguments);
+                    }
+                    catch (Exception ex)
+                    {
+                        result = JsonSerializer.Serialize(new { error = ex.Message });
+                    }
+
+                    // Send intermediate result to client if needed, or just feed back to LLM.
+                    // CopilotKit expects us to handle the loop.
+                    
+                    // 1. Add Assistant Message with Tool Calls to history
+                    chatMessages.Add(new AssistantChatMessage(new[] { ChatToolCall.CreateFunctionToolCall(toolCallId, functionName, BinaryData.FromString(arguments)) }));
+
+                    // 2. Add Tool Message to history
+                    chatMessages.Add(new ToolChatMessage(toolCallId, result));
+                }
+                
+                // Loop back to get the next response from the LLM based on the tool outputs
+                keepIterating = true;
             }
-
-            var payloads = JsonSerializer.Serialize(new
-            {
-                type = "response-text",
-                content = delta,
-            });
-
-            yield return new StreamingChunk(payloads);
         }
     }
 
@@ -241,21 +324,119 @@ public class CopilotService : ICopilotService
             };
         }).ToList();
 
-        var chatClient = _client.GetChatClient(_model);
-        OpenAI.Chat.ChatCompletion completion;
-        try
+        // Inject system prompt to enforce tool usage
+        if (!chatMessages.Any(m => m is SystemChatMessage))
         {
-            completion = await chatClient.CompleteChatAsync(chatMessages, options: null, cancellationToken);
+            chatMessages.Insert(0, new SystemChatMessage("You are a helpful assistant. You have access to tools. Use them to retrieve information when necessary. Once you have the information, provide a detailed natural language response to the user. Do not attempt to display any UI cards."));
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "OpenAI GraphQL generate request failed.");
-            return BuildAssistantErrorGraphQLResponse($"OpenAI request failed: {ex.Message}");
-        }
-        var assistantText = completion.Content[0].Text ?? string.Empty;
 
-        var now = DateTimeOffset.UtcNow;
-        var messageId = Guid.NewGuid().ToString();
+        var chatClient = _client.GetChatClient(_model);
+        var tools = _mcpClient.GetTools().ToList();
+        var options = new ChatCompletionOptions();
+        foreach (var tool in tools)
+        {
+            options.Tools.Add(tool);
+        }
+
+        string assistantText = string.Empty;
+        bool keepIterating = true;
+        int maxIterations = 10; // Safety break
+        int iteration = 0;
+
+        // Track new messages generated during this turn
+        var newMessages = new List<object>();
+
+        while (keepIterating && iteration < maxIterations)
+        {
+            iteration++;
+            keepIterating = false;
+            
+            OpenAI.Chat.ChatCompletion completion;
+            try
+            {
+                completion = await chatClient.CompleteChatAsync(chatMessages, options, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "OpenAI GraphQL generate request failed.");
+                return BuildAssistantErrorGraphQLResponse($"OpenAI request failed: {ex.Message}");
+            }
+
+            if (completion.ToolCalls != null && completion.ToolCalls.Count > 0)
+            {
+                _logger.LogInformation("GraphQL: Received {Count} tool calls.", completion.ToolCalls.Count);
+                chatMessages.Add(new AssistantChatMessage(completion.ToolCalls));
+
+                // Add ActionExecutionMessageOutput for tool calls
+                foreach (var tc in completion.ToolCalls)
+                {
+                    var argsObject = JsonSerializer.Deserialize<Dictionary<string, object>>(tc.FunctionArguments.ToString());
+                    newMessages.Add(new
+                    {
+                        __typename = "ActionExecutionMessageOutput",
+                        id = tc.Id,
+                        createdAt = DateTimeOffset.UtcNow,
+                        name = tc.FunctionName,
+                        arguments = argsObject, // Send as dictionary
+                        scope = "server", // Executed on server
+                        role = "assistant",
+                        parentMessageId = (string?)null,
+                        status = new { __typename = "SuccessMessageStatus", code = "Success" }
+                    });
+                }
+
+                foreach (var toolCall in completion.ToolCalls)
+                {
+                    string result = string.Empty;
+                    try
+                    {
+                        _logger.LogInformation("GraphQL: Executing tool {Name} with args {Args}. ID={Id}", toolCall.FunctionName, toolCall.FunctionArguments, toolCall.Id);
+                        result = await _mcpClient.ExecuteToolAsync(toolCall.FunctionName, toolCall.FunctionArguments.ToString());
+                        _logger.LogInformation("GraphQL: Tool result: {Result}", result);
+                    }
+                    catch (Exception ex)
+                    {
+                        result = JsonSerializer.Serialize(new { error = ex.Message });
+                        _logger.LogError(ex, "GraphQL: Tool execution failed.");
+                    }
+
+                    chatMessages.Add(new ToolChatMessage(toolCall.Id, result));
+
+                    // Add ResultMessageOutput for tool results
+                    newMessages.Add(new
+                    {
+                        __typename = "ResultMessageOutput",
+                        id = Guid.NewGuid().ToString(),
+                        createdAt = DateTimeOffset.UtcNow,
+                        actionExecutionId = toolCall.Id,
+                        actionName = toolCall.FunctionName,
+                        result = result,
+                        role = "tool", // or "function"
+                        parentMessageId = (string?)null,
+                        status = new { __typename = "SuccessMessageStatus", code = "Success" }
+                    });
+                }
+                keepIterating = true;
+            }
+            else
+            {
+                assistantText = completion.Content[0].Text ?? string.Empty;
+                _logger.LogInformation("GraphQL: Received text response: {Text}", assistantText);
+                
+                // Add TextMessageOutput for final response
+                newMessages.Add(new
+                {
+                    __typename = "TextMessageOutput",
+                    id = Guid.NewGuid().ToString(),
+                    createdAt = DateTimeOffset.UtcNow,
+                    content = new[] { assistantText },
+                    role = "assistant",
+                    parentMessageId = (string?)null,
+                    status = new { __typename = "SuccessMessageStatus", code = "Success" }
+                });
+            }
+        }
+
         var threadId = requestedThreadId ?? Guid.NewGuid().ToString();
 
         return new
@@ -273,23 +454,7 @@ public class CopilotService : ICopilotService
                         __typename = "SuccessResponseStatus",
                         code = "Success",
                     },
-                    messages = new object[]
-                    {
-                        new
-                        {
-                            __typename = "TextMessageOutput",
-                            id = messageId,
-                            createdAt = now,
-                            content = new[] { assistantText },
-                            role = "assistant",
-                            parentMessageId = (string?)null,
-                            status = new
-                            {
-                                __typename = "SuccessMessageStatus",
-                                code = "Success",
-                            }
-                        }
-                    },
+                    messages = newMessages.ToArray(),
                     metaEvents = Array.Empty<object>()
                 }
             }
